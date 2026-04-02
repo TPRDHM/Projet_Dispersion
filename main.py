@@ -1,94 +1,227 @@
 from __future__ import annotations
 from dataclasses import dataclass
 from datetime import date
+from typing import Literal
 
-from src.theta_hedging.instruments import Stock, OptionContract, OptionType
-from src.theta_hedging.market_data import YFinanceMarketData, FredRateProvider
-from src.theta_hedging.pricing import BlackScholesPricer
-from src.theta_hedging.portfolio import Portfolio, Position
-from src.theta_hedging.strategies import ThetaHedger
+from src.Strategies.instruments import Stock, OptionContract, OptionType
+from src.Strategies.market_data import YFinanceMarketData, ConstantRateProvider
+from src.Strategies.pricing import BlackScholesInputs, BlackScholesPricer
+from src.Strategies.portfolio import Portfolio, Position
+from src.Strategies.strategies import DispersionSizer, DeltaHedger
+
+
+MatchMetric = Literal["theta_notional", "vega_notional"]
 
 
 @dataclass(frozen=True)
-class Selection:
-    portfolio_contract: OptionContract
-    hedge_contract: OptionContract
+class Straddle:
+    call: OptionContract
+    put: OptionContract
 
 
-def pick_two_calls_same_expiry(symbol: str, expiry: date, md: YFinanceMarketData, spot: float) -> Selection:
-    """
-    Simple deterministic selection:
-    - portfolio option: call strike closest to spot (ATM-ish)
-    - hedge option: call other nearby strike (2nd closest) to avoid identical instrument
-    """
+def pick_common_expiry(
+    exp1: list[date],
+    exp2: list[date],
+    asof: date,
+    min_days: int,
+    max_days: int,
+) -> date:
+    common = sorted(set(exp1).intersection(set(exp2)))
+
+    for d in common:
+        dt = (d - asof).days
+        if min_days <= dt <= max_days:
+            return d
+
+    if not common:
+        raise ValueError("No common expiry found between SPY and AAPL.")
+
+    return common[0]
+
+
+def pick_atm_strike(symbol: str, expiry: date, md: YFinanceMarketData, spot: float) -> float:
     stk = Stock(symbol)
-    tmp = OptionContract(underlying=stk, option_type=OptionType.CALL, strike=0.0, expiry=expiry)
+    tmp = OptionContract(
+        underlying=stk,
+        option_type=OptionType.CALL,
+        strike=0.0,
+        expiry=expiry,
+    )
+
     chain = md.get_option_chain(tmp)
-
     strikes = sorted([float(k) for k in chain["strike"].tolist()])
-    strikes_sorted = sorted(strikes, key=lambda k: abs(k - spot))
 
-    if len(strikes_sorted) < 2:
-        raise ValueError("Not enough strikes to pick two distinct options for this expiry.")
+    return min(strikes, key=lambda k: abs(k - spot))
 
-    k1, k2 = strikes_sorted[0], strikes_sorted[1]
-    c1 = OptionContract(underlying=stk, option_type=OptionType.CALL, strike=k1, expiry=expiry)
-    c2 = OptionContract(underlying=stk, option_type=OptionType.CALL, strike=k2, expiry=expiry)
-    return Selection(portfolio_contract=c1, hedge_contract=c2)
+
+def build_straddle(symbol: str, expiry: date, strike: float) -> Straddle:
+    stk = Stock(symbol)
+
+    return Straddle(
+        call=OptionContract(
+            underlying=stk,
+            option_type=OptionType.CALL,
+            strike=strike,
+            expiry=expiry,
+        ),
+        put=OptionContract(
+            underlying=stk,
+            option_type=OptionType.PUT,
+            strike=strike,
+            expiry=expiry,
+        ),
+    )
+
+
+def straddle_metric_per_contract(
+    metric: MatchMetric,
+    asof: date,
+    straddle: Straddle,
+    spot: float,
+    r_cc: float,
+    q_cc: float,
+    iv_call: float,
+    iv_put: float,
+    pricer: BlackScholesPricer,
+    multiplier: int = 100,
+) -> float:
+    out = 0.0
+
+    for opt, iv in [(straddle.call, iv_call), (straddle.put, iv_put)]:
+        T = pricer.year_fraction(asof, opt.expiry, day_count=pricer.conventions.day_count.days_in_year)
+
+        x = BlackScholesInputs(
+            spot=spot,
+            strike=opt.strike,
+            time_to_expiry_years=T,
+            rate_cc=r_cc,
+            dividend_yield_cc=q_cc,
+            vol=iv,
+        )
+
+        g = pricer.greeks_per_share(opt, x)
+
+        if metric == "theta_notional":
+            out += g.theta_per_day * multiplier
+        elif metric == "vega_notional":
+            out += g.vega * multiplier
+        else:
+            raise ValueError("Unknown metric.")
+
+    return out
 
 
 def main() -> None:
-    # === Parameters you may change ===
-    underlying = "AAPL" # Example; replace by "SPY" etc.
-    portfolio_contracts_qty = 10.0 # long 10 calls
-    target_theta_per_day = 0.0 # theta-neutral
-    # =================================
-
     asof = date.today()
 
+    metric: MatchMetric = "theta_notional"
+    base_qty_spy_straddle = -1.0
+    min_days = 20
+    max_days = 45
+    rate_simple = 0.0
+
     md = YFinanceMarketData()
-    rates = FredRateProvider(series_id="DGS3MO")
+    rates = ConstantRateProvider(annual_rate_simple=rate_simple)
     pricer = BlackScholesPricer()
-    hedger = ThetaHedger(pricer=pricer)
+    sizer = DispersionSizer(pricer=pricer)
+    hedger = DeltaHedger(pricer=pricer)
 
-    # Spot / dividend
-    spot = md.get_spot(underlying)
-    q_simple = md.get_dividend_yield(underlying) # already a decimal; treat as continuous approx
-    q_cc = pricer.to_continuous_rate(q_simple)
+    spy_symbol = "SPY"
+    aapl_symbol = "AAPL"
 
-    # Risk-free
-    r_simple = rates.get_annual_rate(asof)
-    r_cc = pricer.to_continuous_rate(r_simple)
+    spot_spy = md.get_spot(spy_symbol)
+    spot_aapl = md.get_spot(aapl_symbol)
 
-    # Expiries
-    expiries = md.list_expirations(underlying)
-    if not expiries:
-        raise ValueError("No option expirations returned by the data source.")
-    expiry = expiries[0]
+    q_spy_cc = pricer.to_continuous_rate(md.get_dividend_yield(spy_symbol))
+    q_aapl_cc = pricer.to_continuous_rate(md.get_dividend_yield(aapl_symbol))
+    r_cc = pricer.to_continuous_rate(rates.get_annual_rate(asof))
 
-    # nearest expiry; for robustness pick based on your project rules
-    sel = pick_two_calls_same_expiry(underlying, expiry, md, spot)
+    exp_spy = md.list_expirations(spy_symbol)
+    exp_aapl = md.list_expirations(aapl_symbol)
 
-    # Quotes + implied vols
-    q1 = md.get_option_quote(sel.portfolio_contract)
-    q2 = md.get_option_quote(sel.hedge_contract)
+    expiry = pick_common_expiry(exp_spy, exp_aapl, asof, min_days, max_days)
 
-    if q1.implied_vol is None or q2.implied_vol is None:
-        raise ValueError("Implied volatility missing in the chain; choose another expiry/strike or data source.")
+    k_spy = pick_atm_strike(spy_symbol, expiry, md, spot_spy)
+    k_aapl = pick_atm_strike(aapl_symbol, expiry, md, spot_aapl)
 
-    vol_by_option = {
-        sel.portfolio_contract: float(q1.implied_vol),
-        sel.hedge_contract: float(q2.implied_vol),
+    spy_straddle = build_straddle(spy_symbol, expiry, k_spy)
+    aapl_straddle = build_straddle(aapl_symbol, expiry, k_aapl)
+
+    q_spy_call = md.get_option_quote(spy_straddle.call)
+    q_spy_put = md.get_option_quote(spy_straddle.put)
+    q_aapl_call = md.get_option_quote(aapl_straddle.call)
+    q_aapl_put = md.get_option_quote(aapl_straddle.put)
+
+    for q in [q_spy_call, q_spy_put, q_aapl_call, q_aapl_put]:
+        if q.implied_vol is None:
+            raise ValueError("Missing implied volatility in option chain.")
+
+    spy_metric_1 = straddle_metric_per_contract(
+        metric=metric,
+        asof=asof,
+        straddle=spy_straddle,
+        spot=spot_spy,
+        r_cc=r_cc,
+        q_cc=q_spy_cc,
+        iv_call=float(q_spy_call.implied_vol),
+        iv_put=float(q_spy_put.implied_vol),
+        pricer=pricer,
+    )
+
+    aapl_metric_1 = straddle_metric_per_contract(
+        metric=metric,
+        asof=asof,
+        straddle=aapl_straddle,
+        spot=spot_aapl,
+        r_cc=r_cc,
+        q_cc=q_aapl_cc,
+        iv_call=float(q_aapl_call.implied_vol),
+        iv_put=float(q_aapl_put.implied_vol),
+        pricer=pricer,
+    )
+
+    sz = sizer.match(
+        metric=metric,
+        qty_spy_straddle=base_qty_spy_straddle,
+        spy_metric_per_straddle=spy_metric_1,
+        aapl_metric_per_straddle=aapl_metric_1,
+    )
+
+    ptf = Portfolio()
+
+    ptf.add(Position(spy_straddle.call, sz.qty_spy_straddle))
+    ptf.add(Position(spy_straddle.put, sz.qty_spy_straddle))
+
+    ptf.add(Position(aapl_straddle.call, sz.qty_aapl_straddle))
+    ptf.add(Position(aapl_straddle.put, sz.qty_aapl_straddle))
+
+    spot_by_symbol = {
+        spy_symbol: float(spot_spy),
+        aapl_symbol: float(spot_aapl),
     }
 
-    spot_by_symbol = {underlying: float(spot)}
-    div_by_symbol = {underlying: float(q_cc)}
+    div_by_symbol = {
+        spy_symbol: float(q_spy_cc),
+        aapl_symbol: float(q_aapl_cc),
+    }
 
-    # Portfolio build
-    ptf = Portfolio()
-    ptf.add(Position(instrument=sel.portfolio_contract, quantity=portfolio_contracts_qty))
+    vol_by_option = {
+        spy_straddle.call: float(q_spy_call.implied_vol),
+        spy_straddle.put: float(q_spy_put.implied_vol),
+        aapl_straddle.call: float(q_aapl_call.implied_vol),
+        aapl_straddle.put: float(q_aapl_put.implied_vol),
+    }
 
-    theta_before = ptf.theta_total_per_day(
+    trades = hedger.hedge_to_zero_delta(
+        portfolio=ptf,
+        asof=asof,
+        spot_by_symbol=spot_by_symbol,
+        rate_cc=r_cc,
+        dividend_yield_cc_by_symbol=div_by_symbol,
+        vol_by_option=vol_by_option,
+    )
+
+    theta_total = ptf.theta_total_per_day(
         asof=asof,
         spot_by_symbol=spot_by_symbol,
         rate_cc=r_cc,
@@ -97,36 +230,43 @@ def main() -> None:
         pricer=pricer,
     )
 
-    print("=== Inputs ===")
-    print(f"As-of date: {asof.isoformat()}")
-    print(f"Underlying: {underlying} Spot: {spot:.4f}")
-    print(f"Risk-free (DGS3MO) simple: {r_simple:.4%} cc: {r_cc:.4%}")
-    print(f"Dividend yield simple: {q_simple:.4%} cc: {q_cc:.4%}")
-    print(f"Expiry selected: {expiry.isoformat()}")
-
-    print("\n=== Instruments ===")
-    print(f"Portfolio option: {sel.portfolio_contract.pretty_symbol()} IV={q1.implied_vol:.4f}")
-    print(f"Hedge option: {sel.hedge_contract.pretty_symbol()} IV={q2.implied_vol:.4f}")
-
-    print("\n=== Theta before hedge ===")
-    print(f"Portfolio theta/day (currency): {theta_before:.6f}")
-
-    # Hedge
-    res = hedger.hedge_to_target_theta(
-        portfolio=ptf,
+    delta_map = ptf.delta_by_symbol(
         asof=asof,
-        hedge_contract=sel.hedge_contract,
-        target_theta_per_day=target_theta_per_day,
         spot_by_symbol=spot_by_symbol,
         rate_cc=r_cc,
         dividend_yield_cc_by_symbol=div_by_symbol,
         vol_by_option=vol_by_option,
+        pricer=pricer,
     )
 
-    print("\n=== Hedge result ===")
-    print(f"Hedge quantity (contracts): {res.hedge_quantity:.6f}")
-    print(f"Theta/day before: {res.portfolio_theta_before:.6f}")
-    print(f"Theta/day after: {res.portfolio_theta_after:.6f}")
+    print("=== Dispersion Trade Snapshot ===")
+    print(f"As-of: {asof.isoformat()}")
+    print(f"Expiry: {expiry.isoformat()}")
+    print()
+
+    print("=== Straddles ===")
+    print(f"SPY spot={spot_spy:.4f} strike={k_spy:.2f} qty={sz.qty_spy_straddle:.6f}")
+    print(f"AAPL spot={spot_aapl:.4f} strike={k_aapl:.2f} qty={sz.qty_aapl_straddle:.6f}")
+    print()
+
+    print("=== Metric Matching ===")
+    print(f"Metric used: {metric}")
+    print(f"SPY total metric: {sz.spy_metric_value:.6f}")
+    print(f"AAPL total metric: {sz.aapl_metric_value:.6f}")
+    print()
+
+    print("=== Portfolio Theta ===")
+    print(f"Portfolio theta/day: {theta_total:.6f}")
+    print()
+
+    print("=== Delta by Symbol Before Hedge Execution ===")
+    for symbol, delta_val in delta_map.items():
+        print(f"{symbol}: {delta_val:.6f} shares")
+    print()
+
+    print("=== Hedge Trades to Execute ===")
+    for t in trades:
+        print(f"{t.symbol}: trade {t.trade_shares:.6f} shares -> new stock position {t.new_total_shares:.6f}")
 
 
 if __name__ == "__main__":

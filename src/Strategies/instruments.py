@@ -19,8 +19,7 @@ class OptionContract:
     """
     Simple representation of a listed equity/ETF option (vanilla).
     Note: in real markets, equity options are often American style.
-    For this educational project we price them with Black–Scholes (European 
-    approximation).
+    For this educational project we price them with Black–Scholes (European approximation).
     """
     underlying: Stock
     option_type: OptionType
@@ -40,7 +39,7 @@ class OptionQuote:
     last: float | None
     bid: float | None
     ask: float | None
-    implied_vol: float | None # decimal, e.g. 0.25 for 25%
+    implied_vol: float | None  # decimal, e.g. 0.25 for 25%
     timestamp_utc: str | None = None
 
     def mid(self) -> float | None:
